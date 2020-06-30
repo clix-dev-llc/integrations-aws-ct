@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: tenable.io integration with AWS Control Tower
+Parameters:
+  externalId:
+    Type: String
+    Description: External ID for tenable.io role
+Resources:
+  TenableLifeCycleEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Capture Control Tower LifeCycle Events and Trigger an Action
+      EventPattern:
+        detail:
+          eventName:
+          - CreateManagedAccount
+          eventSource:
+          - controltower.amazonaws.com
+        detail-type:
+        - AWS Service Event via CloudTrail
+        source:
+        - aws.controltower
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt "TenableLifeCycle.Arn"
+        Id: TenableLambdaLifeCycle
+
+  TenableLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: Stack_Operations
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: StackSetInstanceCreate
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStackInstances
+                Resource: !Join [':',['arn:aws:cloudformation', !Ref 'AWS::Region', !Ref 'AWS::AccountId', 'stackset/*:*']]
+              - Sid: StackSetCreate
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStackSet
+                  - cloudformation:DescribeStackSet
+                Resource: '*'
+              - Sid: S3Ops
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource: 'arn:aws:s3:::tenable*'
+              - Sid: PassRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Join [':', ['arn:aws:iam:', !Ref "AWS::AccountId", 'role/service-role/AWSControlTowerStackSetRole']]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TenableLifeCycle:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json, boto3, time, logging, os
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              '''Set these to items during the creation of this lambda function'''
+              externalId = os.environ['externalId']
+              masterAccountId = context.invoked_function_arn.split(":")[4]
+              stackSetName = 'Tenable-Connector-Stack-Set'
+              cloudFormationClient = boto3.client('cloudformation')
+              eventDetails = event['detail']
+              eventName = eventDetails['eventName']
+              regionName = eventDetails['awsRegion']
+              serviceEventDetails = eventDetails['serviceEventDetails']
+              if eventName == 'CreateManagedAccount':
+                  newAccountInfo = serviceEventDetails['createManagedAccountStatus']
+                  commandState = newAccountInfo['state']
+                  if commandState == 'SUCCEEDED':
+                      accountId = newAccountInfo['account']['accountId']
+                      accountName = newAccountInfo['account']['accountName']
+                      '''Create stack set in master to be used by the following code to create stack in new account'''
+                      try:
+                          cloudFormationClient.describe_stack_set(StackSetName=stackSetName)
+                      except Exception as describeException:
+                          LOGGER.info('Stack set does not exist, creating it now.')
+                          cloudFormationClient.create_stack_set(
+                              StackSetName=stackSetName,
+                              Description='Tenableio Connector CloudFormation set',
+                              TemplateURL='https://tenable-connectors.s3.amazonaws.com/cloud-templates/aws/Tenable-Connector-CloudFormation.json',
+                              Parameters=[
+                              {
+                                  'ParameterKey': 'TenableExternalId',
+                                  'ParameterValue': externalId,
+                                  'UsePreviousValue': False,
+                                  'ResolvedValue': 'string'
+                              },
+                              {
+                                  'ParameterKey': 'RoleName',
+                                  'ParameterValue': 'tenableio-connector',
+                                  'UsePreviousValue': False,
+                                  'ResolvedValue': 'string'
+                              },
+                              {
+                                  'ParameterKey': 'PrincipalAws',
+                                  'ParameterValue': 'arn:aws:iam::012615275169:root',
+                                  'UsePreviousValue': False,
+                                  'ResolvedValue': 'string'
+                              }
+                              ],
+                              Capabilities=[
+                                  'CAPABILITY_NAMED_IAM'
+                              ],
+                              AdministrationRoleARN='arn:aws:iam::' + masterAccountId + ':role/service-role/AWSControlTowerStackSetRole',
+                              ExecutionRoleName='AWSControlTowerExecution'
+                          )
+                          try:
+                              cloudFormationClient.describe_stack_set(StackSetName=stackSetName)
+                              LOGGER.info('Stack set {} found.'.format(stackSetName))
+                          except StackSetNotFoundException as describeException:
+                              LOGGER.error('Exception getting new stack set, {}'.format(describe_exception))
+                              raise describe_exception
+                      try:
+                          response = cloudFormationClient.create_stack_instances(StackSetName=stackSetName, Accounts=[accountId], Regions=[regionName])
+                          LOGGER.info('Response OperationId is {}'.format(response['OperationId']))
+                      except Exception as create_exception:
+                          LOGGER.error('Exception creating stack instance with {}'.format(create_exception))
+                          raise create_exception
+                  else:
+                      '''Unsuccessful event received'''
+                      LOGGER.info('Unsuccessful event receive. SKIPPING: {}'.format(event))
+                      return 'Skipping event'
+              LOGGER.info('Completed the deployment of Tenableio Connector CloudFormation template to new account: {} ({}).'.format(accountName, accountId))
+              return 'Successfully deployed Tenable.io Connector to the new account named {}.'.format(accountName)
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt "TenableLambdaRole.Arn"
+      Runtime: python3.7
+      Timeout: 60
+      Environment:
+        Variables:
+            externalId: !Ref externalId
+
+  TenableLambdaPermission  :
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt "TenableLifeCycle.Arn"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt "TenableLifeCycleEvents.Arn"
