@@ -4,6 +4,9 @@ Parameters:
   externalId:
     Type: String
     Description: External ID for tenable.io role
+  launchAccountList:
+    Type: String
+    Description: Comma delimited list of accounts to be included during initial launch. All new accounts will be automatically included via AWS Control Tower LifeCycle events.
 Resources:
   TenableLifeCycleEvents:
     Type: AWS::Events::Rule
@@ -73,16 +76,14 @@ Resources:
           import json, boto3, time, logging, os
           LOGGER = logging.getLogger()
           LOGGER.setLevel(logging.INFO)
-
           def lambda_handler(event, context):
-              '''Set these to items during the creation of this lambda function'''
               externalId = os.environ['externalId']
               masterAccountId = context.invoked_function_arn.split(":")[4]
               stackSetName = 'Tenable-Connector-Stack-Set'
               cloudFormationClient = boto3.client('cloudformation')
               eventDetails = event['detail']
               eventName = eventDetails['eventName']
-              regionName = eventDetails['awsRegion']
+              regionName = context.invoked_function_arn.split(":")[3]
               serviceEventDetails = eventDetails['serviceEventDetails']
               if eventName == 'CreateManagedAccount':
                   newAccountInfo = serviceEventDetails['createManagedAccountStatus']
@@ -90,8 +91,8 @@ Resources:
                   if commandState == 'SUCCEEDED':
                       accountId = newAccountInfo['account']['accountId']
                       accountName = newAccountInfo['account']['accountName']
-                      '''Create stack set in master to be used by the following code to create stack in new account'''
                       try:
+                          firstLaunch = False
                           cloudFormationClient.describe_stack_set(StackSetName=stackSetName)
                       except Exception as describeException:
                           LOGGER.info('Stack set does not exist, creating it now.')
@@ -128,21 +129,24 @@ Resources:
                           try:
                               cloudFormationClient.describe_stack_set(StackSetName=stackSetName)
                               LOGGER.info('Stack set {} found.'.format(stackSetName))
+                              firstLaunch = True
                           except StackSetNotFoundException as describeException:
                               LOGGER.error('Exception getting new stack set, {}'.format(describe_exception))
                               raise describe_exception
                       try:
-                          response = cloudFormationClient.create_stack_instances(StackSetName=stackSetName, Accounts=[accountId], Regions=[regionName])
+                          if firstLaunch: accountList = os.environ['seedAccounts'].split(",")
+                          else: accountList = []
+                          accountList.append(accountId)
+                          response = cloudFormationClient.create_stack_instances(StackSetName=stackSetName, Accounts=accountList, Regions=[regionName])
                           LOGGER.info('Response OperationId is {}'.format(response['OperationId']))
                       except Exception as create_exception:
                           LOGGER.error('Exception creating stack instance with {}'.format(create_exception))
                           raise create_exception
                   else:
-                      '''Unsuccessful event received'''
                       LOGGER.info('Unsuccessful event receive. SKIPPING: {}'.format(event))
                       return 'Skipping event'
-              LOGGER.info('Completed the deployment of Tenableio Connector CloudFormation template to new account: {} ({}).'.format(accountName, accountId))
-              return 'Successfully deployed Tenable.io Connector to the new account named {}.'.format(accountName)
+              LOGGER.info('Completed the deployment of Tenableio Connector CloudFormation template to new account: {}.'.format(accountList))
+              return 'Successfully deployed Tenable.io Connector to the new account: {}.'.format(accountList)
       Handler: index.lambda_handler
       MemorySize: 128
       Role: !GetAtt "TenableLambdaRole.Arn"
@@ -151,11 +155,21 @@ Resources:
       Environment:
         Variables:
             externalId: !Ref externalId
+            seedAccounts: !Ref launchAccountList
 
-  TenableLambdaPermission  :
+  TenableLambdaPermission :
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
       FunctionName: !GetAtt "TenableLifeCycle.Arn"
       Principal: events.amazonaws.com
       SourceArn: !GetAtt "TenableLifeCycleEvents.Arn"
+
+  TenableConnectorRole:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        PrincipalAws: arn:aws:iam::012615275169:root
+        RoleName: tenableio-connector
+        TenableExternalId: !Ref externalId
+      TemplateURL: https://tenable-connectors.s3.amazonaws.com/cloud-templates/aws/Tenable-Connector-CloudFormation.json
